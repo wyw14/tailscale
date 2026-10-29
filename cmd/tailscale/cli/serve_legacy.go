@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -178,6 +179,7 @@ type serveEnv struct {
 	tun              bool                // redirect traffic to OS for service
 	allServices      bool                // apply config file to all services
 	acceptAppCaps    []peercap.Cap       // app capabilities to forward
+	headers          http.Header         // custom response headers to add to web mounts
 
 	lc localServeClient // localClient interface, specific to serve
 	// optional stuff for tests:

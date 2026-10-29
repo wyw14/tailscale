@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"iter"
 	"net"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"runtime"
@@ -183,6 +184,15 @@ type HTTPHandler struct {
 	//   - ${HOST}: replaced with the request's Host header value
 	//   - ${REQUEST_URI}: replaced with the request's full URI (path and query string)
 	Redirect string `json:",omitempty"`
+
+	// Headers are custom HTTP response headers added to responses served by
+	// this handler, regardless of its type (path, text, redirect, or proxy).
+	// Reapplying a serve config fully replaces these headers.
+	//
+	// Headers that the handler itself produces (such as Content-Type,
+	// Content-Length, and Location) keep their existing semantics and are
+	// not overridden by a same-named entry here.
+	Headers http.Header `json:",omitempty"`
 
 	// TODO(bradfitz): bool to not enumerate directories? TTL on mapping for
 	// temporary ones? Error codes?

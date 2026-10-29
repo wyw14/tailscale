@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -1874,6 +1875,7 @@ func TestSetServe(t *testing.T) {
 		target        string
 		allowFunnel   bool
 		proxyProtocol int
+		headers       http.Header
 		expected      *ipn.ServeConfig
 		expectErr     bool
 	}{
@@ -1896,6 +1898,48 @@ func TestSetServe(t *testing.T) {
 					},
 				},
 			},
+		},
+		{
+			name:      "add-handler-with-custom-headers",
+			desc:      "add an http handler with custom response headers",
+			cfg:       &ipn.ServeConfig{},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeHTTP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "text:hello",
+			headers: http.Header{
+				"X-Custom": {"custom-value"},
+				"X-Multi":  {"one", "two"},
+			},
+			expected: &ipn.ServeConfig{
+				TCP: map[uint16]*ipn.TCPPortHandler{80: {HTTP: true}},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.test.ts.net:80": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {
+								Text: "hello",
+								Headers: http.Header{
+									"X-Custom": {"custom-value"},
+									"X-Multi":  {"one", "two"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:      "tcp-handler-rejects-custom-headers",
+			desc:      "custom response headers are not valid for TCP forwarding",
+			cfg:       &ipn.ServeConfig{},
+			dnsName:   "foo.test.ts.net",
+			srvType:   serveTypeTCP,
+			srvPort:   80,
+			mountPath: "/",
+			target:    "tcp://localhost:3000",
+			headers:   http.Header{"X-Custom": {"custom-value"}},
+			expectErr: true,
 		},
 		{
 			name: "update-http-handler",
@@ -2158,7 +2202,7 @@ func TestSetServe(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := e.setServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mountPath, tt.target, tt.allowFunnel, magicDNSSuffix, nil, tt.proxyProtocol)
+			err := e.setServe(tt.cfg, tt.dnsName, tt.srvType, tt.srvPort, tt.mountPath, tt.target, tt.allowFunnel, magicDNSSuffix, nil, tt.proxyProtocol, tt.headers)
 			if err != nil && !tt.expectErr {
 				t.Fatalf("got error: %v; did not expect error.", err)
 			}
@@ -2170,6 +2214,72 @@ func TestSetServe(t *testing.T) {
 					// svcName := tailcfg.ServiceName(tt.dnsName)
 					t.Fatalf("got diff:\n%s", diff)
 				}
+			}
+		})
+	}
+}
+
+func TestHeadersFlag(t *testing.T) {
+	tests := []struct {
+		name    string
+		values  []string
+		want    http.Header
+		wantErr bool
+	}{
+		{
+			name:   "simple",
+			values: []string{"X-Custom: custom-value"},
+			want:   http.Header{"X-Custom": {"custom-value"}},
+		},
+		{
+			name:   "value-with-colon",
+			values: []string{"X-Url: https://example.com/path"},
+			want:   http.Header{"X-Url": {"https://example.com/path"}},
+		},
+		{
+			name:   "repeated-accumulates-values",
+			values: []string{"X-Multi: one", "X-Multi: two"},
+			want:   http.Header{"X-Multi": {"one", "two"}},
+		},
+		{
+			name:   "canonicalizes-name",
+			values: []string{"x-custom: v"},
+			want:   http.Header{"X-Custom": {"v"}},
+		},
+		{
+			name:    "missing-colon",
+			values:  []string{"X-Custom"},
+			wantErr: true,
+		},
+		{
+			name:    "empty-name",
+			values:  []string{": value"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid-name",
+			values:  []string{"X Custom: value"},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var h http.Header
+			f := headersFlag{Value: &h}
+			var sawErr bool
+			for _, v := range tt.values {
+				if err := f.Set(v); err != nil {
+					sawErr = true
+				}
+			}
+			if sawErr != tt.wantErr {
+				t.Fatalf("got error = %v, wantErr = %v", sawErr, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if diff := cmp.Diff(tt.want, h); diff != "" {
+				t.Fatalf("headers mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}

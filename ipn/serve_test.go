@@ -4,6 +4,9 @@
 package ipn
 
 import (
+	"encoding/json"
+	"net/http"
+	"reflect"
 	"testing"
 
 	"tailscale.com/ipn/ipnstate"
@@ -536,6 +539,67 @@ func TestIsServingUnixAny(t *testing.T) {
 				t.Errorf("ServeConfig.IsServingUnixAny() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHTTPHandlerHeadersJSON(t *testing.T) {
+	h := &HTTPHandler{
+		Proxy: "http://localhost:3000",
+		Headers: http.Header{
+			"X-Custom": {"custom-value"},
+			"X-Multi":  {"one", "two"},
+		},
+	}
+	bs, err := json.Marshal(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got HTTPHandler
+	if err := json.Unmarshal(bs, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Proxy != h.Proxy {
+		t.Errorf("Proxy = %q, want %q", got.Proxy, h.Proxy)
+	}
+	if !reflect.DeepEqual(got.Headers, h.Headers) {
+		t.Errorf("Headers = %v, want %v", got.Headers, h.Headers)
+	}
+
+	// Handlers without custom headers must not serialize the field, so
+	// existing serve configs remain byte-for-byte compatible.
+	bs, err = json.Marshal(&HTTPHandler{Text: "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(bs, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["Headers"]; ok {
+		t.Errorf("Headers should be omitted when unset, got %s", bs)
+	}
+}
+
+func TestHTTPHandlerCloneHeaders(t *testing.T) {
+	src := &HTTPHandler{
+		Text: "hello",
+		Headers: http.Header{
+			"X-Custom": {"custom-value"},
+			"X-Multi":  {"one", "two"},
+		},
+	}
+	dst := src.Clone()
+	if !reflect.DeepEqual(dst.Headers, src.Headers) {
+		t.Fatalf("cloned Headers = %v, want %v", dst.Headers, src.Headers)
+	}
+	// Mutating the clone must not affect the original.
+	dst.Headers.Set("X-Custom", "mutated")
+	dst.Headers.Add("X-Multi", "three")
+	if got := src.Headers.Get("X-Custom"); got != "custom-value" {
+		t.Errorf("original X-Custom mutated to %q", got)
+	}
+	if got := src.Headers.Values("X-Multi"); !reflect.DeepEqual(got, []string{"one", "two"}) {
+		t.Errorf("original X-Multi mutated to %v", got)
 	}
 }
 

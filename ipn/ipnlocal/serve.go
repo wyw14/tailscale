@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
+	"net/textproto"
 	"net/url"
 	"os"
 	"path"
@@ -1196,6 +1197,12 @@ func (b *LocalBackend) serveWebHandler(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if configured := h.Headers(); configured.Len() > 0 {
+		w = &customHeaderResponseWriter{
+			ResponseWriter: w,
+			headers:        http.Header(configured.AsMap()),
+		}
+	}
 	if s := h.Text(); s != "" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		io.WriteString(w, s)
@@ -1279,6 +1286,66 @@ func (b *LocalBackend) serveFileOrDirectory(w http.ResponseWriter, r *http.Reque
 		ResponseWriter: w,
 		mountPoint:     mountPoint,
 	}, r)
+}
+
+// customHeaderResponseWriter is an http.ResponseWriter wrapper that adds the
+// custom response headers configured on a serve mount the first time the
+// response headers are flushed. A header that the handler itself has already
+// produced (such as Content-Type, Content-Length, or Location) is left
+// untouched, so the handler's existing response semantics are preserved.
+type customHeaderResponseWriter struct {
+	http.ResponseWriter
+	headers http.Header
+	addOnce sync.Once // guards addHeaders
+}
+
+// Unwrap exposes the wrapped ResponseWriter to http.NewResponseController so
+// that capabilities such as flushing and hijacking continue to work through
+// the wrapper (e.g. for streaming or upgraded proxy responses).
+func (w *customHeaderResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+func (w *customHeaderResponseWriter) addHeaders() {
+	dst := w.ResponseWriter.Header()
+	for key, values := range w.headers {
+		// http.Header keys are canonicalized; do the same for the
+		// configured key so the presence check is reliable regardless
+		// of how the header was spelled in the serve config.
+		key = textproto.CanonicalMIMEHeaderKey(key)
+		if key == "Content-Length" {
+			// Content-Length is derived from the actual body by the HTTP
+			// machinery; never let a configured value change that.
+			continue
+		}
+		if _, ok := dst[key]; ok {
+			// The handler produced this header itself (e.g. Content-Type
+			// or Location); do not override it.
+			continue
+		}
+		for _, v := range values {
+			dst.Add(key, v)
+		}
+	}
+}
+
+func (w *customHeaderResponseWriter) WriteHeader(statusCode int) {
+	w.addOnce.Do(w.addHeaders)
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+func (w *customHeaderResponseWriter) Write(p []byte) (int, error) {
+	w.addOnce.Do(w.addHeaders)
+	return w.ResponseWriter.Write(p)
+}
+
+// Flush flushes any buffered data to the client, adding the custom headers
+// first if the response headers have not been flushed yet.
+func (w *customHeaderResponseWriter) Flush() {
+	w.addOnce.Do(w.addHeaders)
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // fixLocationHeaderResponseWriter is an http.ResponseWriter wrapper that, upon

@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -28,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"golang.org/x/net/http/httpguts"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
@@ -136,6 +139,53 @@ func (u *acceptAppCapsFlag) String() string {
 	return strings.Join(s, ",")
 }
 
+// headersFlag implements flag.Value to collect custom HTTP response headers
+// from repeatable --header "Name: value" flags. Repeating the same header
+// name accumulates multiple values, and reapplying a serve config replaces
+// all previously configured headers.
+type headersFlag struct {
+	Value *http.Header
+}
+
+func (f *headersFlag) Set(s string) error {
+	name, value, ok := strings.Cut(s, ":")
+	if !ok {
+		return fmt.Errorf("%q is not a valid header; expected 'Name: value'", s)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("missing header name in %q; expected 'Name: value'", s)
+	}
+	if !httpguts.ValidHeaderFieldName(name) {
+		return fmt.Errorf("invalid header name %q", name)
+	}
+	// Trim the optional whitespace that conventionally separates a header
+	// value from the colon.
+	value = strings.TrimSpace(value)
+	if !httpguts.ValidHeaderFieldValue(value) {
+		return fmt.Errorf("invalid header value %q for %q", value, name)
+	}
+	if *f.Value == nil {
+		*f.Value = make(http.Header)
+	}
+	f.Value.Add(name, value)
+	return nil
+}
+
+func (f *headersFlag) String() string {
+	if f.Value == nil || len(*f.Value) == 0 {
+		return ""
+	}
+	names := slices.Sorted(maps.Keys(*f.Value))
+	var parts []string
+	for _, name := range names {
+		for _, v := range (*f.Value)[name] {
+			parts = append(parts, name+": "+v)
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 var serveHelpCommon = strings.TrimSpace(`
 <target> can be a file, directory, text, or most commonly the location to a service running on the
 local machine. The location to the location service can be expressed as a port number (e.g., 3000),
@@ -240,6 +290,7 @@ func newServeV2Command(e *serveEnv, subcmd serveMode) *ffcli.Command {
 		FlagSet: e.newFlags("serve-set", func(fs *flag.FlagSet) {
 			fs.Var(&e.bg, "bg", "Run the command as a background process (default false, when --service is set defaults to true).")
 			fs.StringVar(&e.setPath, "set-path", "", "Appends the specified path to the base URL for accessing the underlying service")
+			fs.Var(&headersFlag{Value: &e.headers}, "header", "Set a custom HTTP response header in 'Name: value' form on the mount; may be specified multiple times")
 			fs.UintVar(&e.https, "https", 0, "Expose an HTTPS server at the specified port (default mode)")
 			if subcmd == serve {
 				fs.UintVar(&e.http, "http", 0, "Expose an HTTP server at the specified port")
@@ -526,7 +577,7 @@ func (e *serveEnv) runServeCombined(subcmd serveMode) execFunc {
 			if err := e.shouldWarnRemoteDestCompatibility(ctx, target); err != nil {
 				return err
 			}
-			err = e.setServe(sc, dnsName, srvType, srvPort, mount, target, funnel, magicDNSSuffix, e.acceptAppCaps, int(e.proxyProtocol))
+			err = e.setServe(sc, dnsName, srvType, srvPort, mount, target, funnel, magicDNSSuffix, e.acceptAppCaps, int(e.proxyProtocol), e.headers)
 			msg = e.messageForPort(sc, st, dnsName, srvType, srvPort)
 		}
 		if err != nil {
@@ -923,7 +974,7 @@ func (e *serveEnv) runServeSetConfig(ctx context.Context, args []string) (err er
 	for name, details := range scf.Services {
 		for ppr, ep := range details.Endpoints {
 			if ep.Protocol == conffile.ProtoTUN {
-				err := e.setServe(sc, name.String(), serveTypeTUN, 0, "", "", false, magicDNSSuffix, nil, 0 /* proxy protocol */)
+				err := e.setServe(sc, name.String(), serveTypeTUN, 0, "", "", false, magicDNSSuffix, nil, 0 /* proxy protocol */, nil /* headers */)
 				if err != nil {
 					return err
 				}
@@ -956,7 +1007,7 @@ func (e *serveEnv) runServeSetConfig(ctx context.Context, args []string) (err er
 					}
 					target = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ep.Destination, portStr))
 				}
-				err := e.setServe(sc, name.String(), serveType, port, "/", target, false, magicDNSSuffix, nil, 0 /* proxy protocol */)
+				err := e.setServe(sc, name.String(), serveType, port, "/", target, false, magicDNSSuffix, nil, 0 /* proxy protocol */, nil /* headers */)
 				if err != nil {
 					return fmt.Errorf("service %q: %w", name, err)
 				}
@@ -1003,12 +1054,12 @@ func (e *serveEnv) runServeSetConfig(ctx context.Context, args []string) (err er
 	return e.lc.SetServeConfig(ctx, sc)
 }
 
-func (e *serveEnv) setServe(sc *ipn.ServeConfig, dnsName string, srvType serveType, srvPort uint16, mount string, target string, allowFunnel bool, mds string, caps []peercap.Cap, proxyProtocol int) error {
+func (e *serveEnv) setServe(sc *ipn.ServeConfig, dnsName string, srvType serveType, srvPort uint16, mount string, target string, allowFunnel bool, mds string, caps []peercap.Cap, proxyProtocol int, headers http.Header) error {
 	// update serve config based on the type
 	switch srvType {
 	case serveTypeHTTPS, serveTypeHTTP:
 		useTLS := srvType == serveTypeHTTPS
-		err := e.applyWebServe(sc, dnsName, srvPort, useTLS, mount, target, mds, caps)
+		err := e.applyWebServe(sc, dnsName, srvPort, useTLS, mount, target, mds, caps, headers)
 		if err != nil {
 			return fmt.Errorf("failed apply web serve: %w", err)
 		}
@@ -1016,11 +1067,17 @@ func (e *serveEnv) setServe(sc *ipn.ServeConfig, dnsName string, srvType serveTy
 		if e.setPath != "" {
 			return fmt.Errorf("cannot mount a path for TCP serve")
 		}
+		if len(headers) > 0 {
+			return fmt.Errorf("cannot set custom response headers for TCP serve")
+		}
 		err := e.applyTCPServe(sc, dnsName, srvType, srvPort, target, mds, proxyProtocol)
 		if err != nil {
 			return fmt.Errorf("failed to apply TCP serve: %w", err)
 		}
 	case serveTypeTUN:
+		if len(headers) > 0 {
+			return fmt.Errorf("cannot set custom response headers for TUN serve")
+		}
 		// Caller checks that TUN mode is only supported for services.
 		svcName := tailcfg.ServiceName(dnsName)
 		if _, ok := sc.Services[svcName]; !ok {
@@ -1254,8 +1311,12 @@ func (e *serveEnv) shouldWarnRemoteDestCompatibility(ctx context.Context, target
 	return nil
 }
 
-func (e *serveEnv) applyWebServe(sc *ipn.ServeConfig, dnsName string, srvPort uint16, useTLS bool, mount, target, mds string, caps []peercap.Cap) error {
+func (e *serveEnv) applyWebServe(sc *ipn.ServeConfig, dnsName string, srvPort uint16, useTLS bool, mount, target, mds string, caps []peercap.Cap, headers http.Header) error {
 	h := new(ipn.HTTPHandler)
+	// Clone so the stored serve config owns its own copy of the map;
+	// setting a handler replaces any existing handler at the mount, so
+	// these headers fully replace the previously configured ones.
+	h.Headers = headers.Clone()
 	switch {
 	case strings.HasPrefix(target, "text:"):
 		text := strings.TrimPrefix(target, "text:")

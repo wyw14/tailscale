@@ -8,6 +8,7 @@ package ipn
 import (
 	jsonv1 "encoding/json"
 	"errors"
+	"net/http"
 	"net/netip"
 	"time"
 
@@ -946,6 +947,17 @@ func (v HTTPHandlerView) AcceptAppCaps() views.Slice[peercap.Cap] {
 //   - ${REQUEST_URI}: replaced with the request's full URI (path and query string)
 func (v HTTPHandlerView) Redirect() string { return v.ж.Redirect }
 
+// Headers are custom HTTP response headers added to responses served by
+// this handler, regardless of its type (path, text, redirect, or proxy).
+// Reapplying a serve config fully replaces these headers.
+//
+// Headers that the handler itself produces (such as Content-Type,
+// Content-Length, and Location) keep their existing semantics and are
+// not overridden by a same-named entry here.
+func (v HTTPHandlerView) Headers() views.MapSlice[string, string] {
+	return views.MapSliceOf(v.ж.Headers)
+}
+
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _HTTPHandlerViewNeedsRegeneration = HTTPHandler(struct {
 	Path          string
@@ -953,6 +965,7 @@ var _HTTPHandlerViewNeedsRegeneration = HTTPHandler(struct {
 	Text          string
 	AcceptAppCaps []peercap.Cap
 	Redirect      string
+	Headers       http.Header
 }{})
 
 // View returns a read-only view of WebServerConfig.

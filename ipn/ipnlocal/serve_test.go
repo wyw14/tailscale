@@ -1731,6 +1731,169 @@ func TestServeHTTPRedirect(t *testing.T) {
 	}
 }
 
+func TestServeCustomHeaders(t *testing.T) {
+	const host = "headers-example.ts.net"
+
+	b := newTestBackend(t)
+
+	// Backend used by the proxy handler. It sets its own Content-Type so the
+	// test can verify backend-produced headers are not overridden.
+	testServ := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/from-backend")
+		w.Header().Set("X-Backend", "yes")
+		io.WriteString(w, "backend response")
+	}))
+	defer testServ.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "hello.txt"), []byte("file contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	configure := func(t *testing.T, mount string, h *ipn.HTTPHandler) {
+		t.Helper()
+		conf := &ipn.ServeConfig{
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				host + ":443": {Handlers: map[string]*ipn.HTTPHandler{mount: h}},
+			},
+		}
+		if err := b.SetServeConfig(conf, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	doReq := func(t *testing.T, reqPath string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := &http.Request{
+			URL: &url.URL{Path: reqPath},
+			TLS: &tls.ConnectionState{ServerName: host},
+		}
+		req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+			DestPort: 443,
+			SrcAddr:  netip.MustParseAddrPort("1.2.3.4:1234"), // random src
+		}))
+		w := httptest.NewRecorder()
+		b.serveWebHandler(w, req)
+		return w
+	}
+
+	// configuredHeaders include a custom header, a multi-valued header, and
+	// attempts to override protocol headers that handlers produce themselves.
+	configuredHeaders := http.Header{
+		"X-Custom":       {"custom-value"},
+		"X-Multi":        {"one", "two"},
+		"Content-Type":   {"application/should-not-win"},
+		"Content-Length": {"999"},
+		"Location":       {"https://should-not-win.example/"},
+	}
+
+	assertConfiguredHeaders := func(t *testing.T, w *httptest.ResponseRecorder) {
+		t.Helper()
+		h := w.Result().Header
+		if got := h.Get("X-Custom"); got != "custom-value" {
+			t.Errorf("X-Custom = %q, want custom-value", got)
+		}
+		if got, want := h.Values("X-Multi"), []string{"one", "two"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("X-Multi = %v, want %v", got, want)
+		}
+		// Protocol headers produced by the handler must not be replaced by
+		// the configured values.
+		if got := h.Get("Content-Length"); got == "999" {
+			t.Errorf("Content-Length was overridden to %q", got)
+		}
+	}
+
+	t.Run("text", func(t *testing.T) {
+		configure(t, "/", &ipn.HTTPHandler{Text: "hello", Headers: configuredHeaders})
+		w := doReq(t, "/")
+		assertConfiguredHeaders(t, w)
+		if got := w.Result().Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+		}
+		if body := w.Body.String(); body != "hello" {
+			t.Errorf("body = %q, want hello", body)
+		}
+	})
+
+	t.Run("redirect", func(t *testing.T) {
+		configure(t, "/old", &ipn.HTTPHandler{Redirect: "https://example.com/new", Headers: configuredHeaders})
+		w := doReq(t, "/old")
+		assertConfiguredHeaders(t, w)
+		if w.Code != http.StatusFound {
+			t.Errorf("status = %d, want %d", w.Code, http.StatusFound)
+		}
+		if got := w.Result().Header.Get("Location"); got != "https://example.com/new" {
+			t.Errorf("Location = %q, want https://example.com/new", got)
+		}
+	})
+
+	t.Run("file", func(t *testing.T) {
+		configure(t, "/hello.txt", &ipn.HTTPHandler{Path: filepath.Join(dir, "hello.txt"), Headers: configuredHeaders})
+		w := doReq(t, "/hello.txt")
+		assertConfiguredHeaders(t, w)
+		if got := w.Result().Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+		}
+		if body := w.Body.String(); body != "file contents" {
+			t.Errorf("body = %q, want file contents", body)
+		}
+	})
+
+	t.Run("proxy", func(t *testing.T) {
+		configure(t, "/", &ipn.HTTPHandler{Proxy: testServ.URL, Headers: configuredHeaders})
+		w := doReq(t, "/")
+		assertConfiguredHeaders(t, w)
+		h := w.Result().Header
+		if got := h.Get("Content-Type"); got != "text/from-backend" {
+			t.Errorf("Content-Type = %q, want text/from-backend", got)
+		}
+		if got := h.Get("X-Backend"); got != "yes" {
+			t.Errorf("X-Backend = %q, want yes", got)
+		}
+		if body := strings.TrimSpace(w.Body.String()); body != "backend response" {
+			t.Errorf("body = %q, want backend response", body)
+		}
+	})
+
+	t.Run("reapply_replaces_headers", func(t *testing.T) {
+		configure(t, "/", &ipn.HTTPHandler{
+			Text:    "hello",
+			Headers: http.Header{"X-Old": {"old-value"}},
+		})
+		w := doReq(t, "/")
+		if got := w.Result().Header.Get("X-Old"); got != "old-value" {
+			t.Fatalf("X-Old = %q, want old-value", got)
+		}
+
+		// Reapplying the config replaces the handler, and therefore all of
+		// its custom headers; X-Old must not linger.
+		configure(t, "/", &ipn.HTTPHandler{
+			Text:    "hello",
+			Headers: http.Header{"X-New": {"new-value"}},
+		})
+		w = doReq(t, "/")
+		h := w.Result().Header
+		if got := h.Get("X-New"); got != "new-value" {
+			t.Errorf("X-New = %q, want new-value", got)
+		}
+		if got := h.Get("X-Old"); got != "" {
+			t.Errorf("X-Old = %q, want it removed after reapply", got)
+		}
+	})
+
+	t.Run("unconfigured_unchanged", func(t *testing.T) {
+		configure(t, "/", &ipn.HTTPHandler{Text: "hello"})
+		w := doReq(t, "/")
+		h := w.Result().Header
+		if got := h.Get("X-Custom"); got != "" {
+			t.Errorf("X-Custom = %q, want empty when no custom headers are configured", got)
+		}
+		if got := h.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+			t.Errorf("Content-Type = %q, want text/plain; charset=utf-8", got)
+		}
+	})
+}
+
 func TestValidateServeConfigUpdate(t *testing.T) {
 	tests := []struct {
 		name, description  string

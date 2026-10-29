@@ -7,6 +7,7 @@ package ipn
 
 import (
 	"maps"
+	"net/http"
 	"net/netip"
 	"time"
 
@@ -240,6 +241,7 @@ func (src *HTTPHandler) Clone() *HTTPHandler {
 	dst := new(HTTPHandler)
 	*dst = *src
 	dst.AcceptAppCaps = append(src.AcceptAppCaps[:0:0], src.AcceptAppCaps...)
+	dst.Headers = src.Headers.Clone()
 	return dst
 }
 
@@ -250,6 +252,7 @@ var _HTTPHandlerCloneNeedsRegeneration = HTTPHandler(struct {
 	Text          string
 	AcceptAppCaps []peercap.Cap
 	Redirect      string
+	Headers       http.Header
 }{})
 
 // Clone makes a deep copy of WebServerConfig.
