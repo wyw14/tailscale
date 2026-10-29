@@ -49,9 +49,11 @@ import (
 	"tailscale.com/types/views"
 	"tailscale.com/util/checkchange"
 	"tailscale.com/util/clientmetric"
+	"tailscale.com/util/deephash"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/stagedop"
 	"tailscale.com/util/testenv"
 	"tailscale.com/util/usermetric"
 	"tailscale.com/version"
@@ -126,6 +128,19 @@ type userspaceEngine struct {
 	lastRouter     *router.Config
 	lastDNSConfig  dns.ConfigView // or invalid if none
 	reconfigureVPN func() error   // or nil
+
+	// idempotentReconfig state. All fields are only touched while e.wgLock is
+	// held (i.e. within Reconfig), and only when debugIdempotentReconfig is
+	// enabled; the default Reconfig path does not use them.
+	//
+	// idemReconfig runs the router/DNS/VPN stages of a reconfig as one
+	// idempotently-keyed operation: a retry after a partial failure or
+	// cancellation skips stages already confirmed by the watermark. idemKey
+	// identifies the current (content-hashed) reconfig operation.
+	idemReconfig   *stagedop.Executor
+	idemKey        stagedop.Key
+	idemRouterHash deephash.Sum // hash of the last confirmed router config
+	idemDNSHash    deephash.Sum // hash of the last confirmed DNS config
 
 	// lastAppliedDisableTUNUDPGRO and lastAppliedDisableTUNTCPGRO cache the
 	// controlknobs values that were last applied to the TUN device. They are
@@ -842,6 +857,27 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 
 	peerMTUEnable := e.magicConn.ShouldPMTUD()
 
+	// The idempotent reconfig path is opt-in and off by default.
+	idem := debugIdempotentReconfig()
+	var idemKey stagedop.Key
+	var idemRouterHash, idemDNSHash deephash.Sum
+	if idem {
+		if e.idemReconfig == nil {
+			e.idemReconfig = stagedop.NewExecutor(stagedop.WithLogger(e.logf))
+		}
+		idemRouterHash = deephash.Hash(routerCfg)
+		if buildfeatures.HasDNS {
+			idemDNSHash = deephash.Hash(dnsCfg)
+		}
+		idemKey = reconfigIdempotencyKey(cfg, routerCfg, dnsCfg, listenPort, peerMTUEnable)
+		// A new generation supersedes any unconfirmed work left over from a
+		// previous, now-stale generation.
+		if e.idemKey != "" && e.idemKey != idemKey {
+			e.idemReconfig.Forget(e.idemKey)
+		}
+		e.idemKey = idemKey
+	}
+
 	// Let the BIRD integration recompute whether this node is a
 	// primary subnet router, before the early return below so that a
 	// change in that state alone still reaches the protocol toggle in
@@ -870,7 +906,19 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 		netlogChanged = e.netlogger.Reconfig(routerCfg, routerChanged)
 	}
 
-	if !engineChanged && !routerChanged && !dnsChanged && !listenPortChanged && !birdChanged && !peerMTUChanged && !netlogChanged {
+	// Under the idempotent path, a stage can remain unconfirmed even when the
+	// cached "last" snapshots were already advanced: the previous attempt of
+	// this generation failed or was interrupted after updating them but
+	// before the stage succeeded. Such a retry must not take the ErrNoChanges
+	// early return.
+	idemPending := false
+	if idem {
+		routerNeedsApply := idemRouterHash != e.idemRouterHash
+		dnsNeedsApply := buildfeatures.HasDNS && (idemDNSHash != e.idemDNSHash || routerNeedsApply)
+		idemPending = routerNeedsApply || dnsNeedsApply
+	}
+
+	if !engineChanged && !routerChanged && !dnsChanged && !listenPortChanged && !birdChanged && !peerMTUChanged && !netlogChanged && !idemPending {
 		return ErrNoChanges
 	}
 
@@ -908,45 +956,117 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	// per peer by [Engine.SyncDevicePeer]), and its private key is set
 	// above when it changes.
 
-	// A router.Set error is recorded but must not abort the reconfig: DNS
-	// configuration below must be attempted independently. See #20447.
-	var routerErr error
-	if routerChanged {
-		e.logf("wgengine: Reconfig: configuring router")
-		routerErr = e.router.Set(routerCfg)
-		e.health.SetRouterHealth(routerErr)
-		if routerErr != nil {
-			e.logf("wgengine: Reconfig: router config failed (%v); continuing to DNS config so name resolution still works", routerErr)
+	var reconfigErr error
+	if idem {
+		// Idempotent, resumable path (opt-in; see debugIdempotentReconfig).
+		//
+		// The side-effecting work is one operation keyed by the content of
+		// this reconfig. Every stage is confirmed only after it succeeds, and
+		// the executor's watermark skips confirmed stages on retry: a jittered,
+		// canceled, or retried reconfig never repeats work that is already
+		// durably applied, while any original stage error is surfaced.
+		//
+		// The router and DNS stages are independent (a router failure must not
+		// prevent DNS configuration; see #20447); the VPN stage depends on DNS
+		// and runs only once DNS is confirmed.
+		var plan []stagedop.Stage
+		routerNeedsApply := idemRouterHash != e.idemRouterHash
+		if routerNeedsApply {
+			plan = append(plan, stagedop.Stage{
+				Name: "router",
+				Do: func(context.Context) error {
+					e.logf("wgengine: Reconfig: configuring router")
+					err := e.router.Set(routerCfg)
+					e.health.SetRouterHealth(err)
+					if err != nil {
+						e.logf("wgengine: Reconfig: router config failed (%v); continuing to DNS config so name resolution still works", err)
+						return err
+					}
+					e.idemRouterHash = idemRouterHash
+					return nil
+				},
+			})
 		}
-	}
+		// Mirror the default path's historical quirk of re-evaluating DNS
+		// whenever the router also needs to be applied.
+		dnsNeedsApply := buildfeatures.HasDNS && (idemDNSHash != e.idemDNSHash || routerNeedsApply)
+		if dnsNeedsApply {
+			plan = append(plan,
+				stagedop.Stage{
+					Name: "dns",
+					Do: func(context.Context) error {
+						if resolver.ShouldUseRoutes(e.controlKnobs) {
+							e.logf("wgengine: Reconfig: user dialer")
+							e.dialer.SetRoutes(routerCfg.Routes, routerCfg.LocalRoutes)
+						} else {
+							e.dialer.SetRoutes(nil, nil)
+						}
 
-	// We've historically re-set DNS even after just a router change. While
-	// refactoring in tailscale/tailscale#17448 and
-	// tailscale/tailscale#17499, I'm erring on the side of keeping that
-	// historical quirk for now (2025-10-08), lest it's load bearing in
-	// unexpected ways
-	//
-	// TODO(bradfitz): try to do the "configuring DNS" part below only if
-	// dnsChanged, not routerChanged. The "resolver.ShouldUseRoutes" part
-	// probably needs to keep happening for both.
-	var dnsErr, vpnErr error
-	if buildfeatures.HasDNS && (routerChanged || dnsChanged) {
-		if resolver.ShouldUseRoutes(e.controlKnobs) {
-			e.logf("wgengine: Reconfig: user dialer")
-			e.dialer.SetRoutes(routerCfg.Routes, routerCfg.LocalRoutes)
-		} else {
-			e.dialer.SetRoutes(nil, nil)
+						// Keep DNS configuration after router configuration,
+						// as some DNS managers refuse to apply settings if the
+						// device has no assigned address.
+						e.logf("wgengine: Reconfig: configuring DNS")
+						err := e.dns.Set(*dnsCfg)
+						e.health.SetDNSHealth(err)
+						if err != nil {
+							return err
+						}
+						e.idemDNSHash = idemDNSHash
+						return nil
+					},
+				},
+				stagedop.Stage{
+					// VPN configuration follows DNS exactly like the default
+					// path's dnsErr == nil gate.
+					Name: "vpn",
+					Deps: []string{"dns"},
+					Do:   func(context.Context) error { return e.reconfigureVPNIfNecessary() },
+				},
+			)
+		}
+		reconfigErr = e.idemReconfig.Run(context.Background(), idemKey, plan)
+	} else {
+		// A router.Set error is recorded but must not abort the reconfig: DNS
+		// configuration below must be attempted independently. See #20447.
+		var routerErr error
+		if routerChanged {
+			e.logf("wgengine: Reconfig: configuring router")
+			routerErr = e.router.Set(routerCfg)
+			e.health.SetRouterHealth(routerErr)
+			if routerErr != nil {
+				e.logf("wgengine: Reconfig: router config failed (%v); continuing to DNS config so name resolution still works", routerErr)
+			}
 		}
 
-		// Keep DNS configuration after router configuration, as some
-		// DNS managers refuse to apply settings if the device has no
-		// assigned address.
-		e.logf("wgengine: Reconfig: configuring DNS")
-		dnsErr = e.dns.Set(*dnsCfg)
-		e.health.SetDNSHealth(dnsErr)
-		if dnsErr == nil {
-			vpnErr = e.reconfigureVPNIfNecessary()
+		// We've historically re-set DNS even after just a router change. While
+		// refactoring in tailscale/tailscale#17448 and
+		// tailscale/tailscale#17499, I'm erring on the side of keeping that
+		// historical quirk for now (2025-10-08), lest it's load bearing in
+		// unexpected ways
+		//
+		// TODO(bradfitz): try to do the "configuring DNS" part below only if
+		// dnsChanged, not routerChanged. The "resolver.ShouldUseRoutes" part
+		// probably needs to keep happening for both.
+		var dnsErr, vpnErr error
+		if buildfeatures.HasDNS && (routerChanged || dnsChanged) {
+			if resolver.ShouldUseRoutes(e.controlKnobs) {
+				e.logf("wgengine: Reconfig: user dialer")
+				e.dialer.SetRoutes(routerCfg.Routes, routerCfg.LocalRoutes)
+			} else {
+				e.dialer.SetRoutes(nil, nil)
+			}
+
+			// Keep DNS configuration after router configuration, as some
+			// DNS managers refuse to apply settings if the device has no
+			// assigned address.
+			e.logf("wgengine: Reconfig: configuring DNS")
+			dnsErr = e.dns.Set(*dnsCfg)
+			e.health.SetDNSHealth(dnsErr)
+			if dnsErr == nil {
+				vpnErr = e.reconfigureVPNIfNecessary()
+			}
 		}
+		reconfigErr = errors.Join(routerErr, dnsErr, vpnErr)
 	}
 
 	// Let the network flow logger finish reacting, pairing the Reconfig
@@ -967,7 +1087,28 @@ func (e *userspaceEngine) Reconfig(cfg *wgcfg.Config, routerCfg *router.Config, 
 	}
 
 	e.logf("[v1] wgengine: Reconfig done")
-	return errors.Join(routerErr, dnsErr, vpnErr)
+	return reconfigErr
+}
+
+// debugIdempotentReconfig opts into the idempotently-keyed, stage-watermarked
+// Reconfig path. It defaults to false; with it unset (the default), Reconfig
+// takes the historical single-goroutine, non-resumable path with identical
+// behavior and parameters.
+var debugIdempotentReconfig = envknob.RegisterBool("TS_DEBUG_IDEMPOTENT_RECONFIG")
+
+// reconfigIdempotencyKey derives the idempotency key for a reconfig from the
+// full content of the policy update being applied. Retries of the same update
+// produce the same key and share the stage watermark; a different update gets
+// a different key and is applied independently.
+func reconfigIdempotencyKey(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *dns.Config, listenPort uint16, peerMTUEnable bool) stagedop.Key {
+	sum := deephash.Hash(&struct {
+		Cfg        *wgcfg.Config
+		Router     *router.Config
+		DNS        *dns.Config
+		ListenPort uint16
+		PeerMTU    bool
+	}{cfg, routerCfg, dnsCfg, listenPort, peerMTUEnable})
+	return stagedop.Key("reconfig:" + sum.String())
 }
 
 func (e *userspaceEngine) GetFilter() *filter.Filter {
